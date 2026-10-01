@@ -1,13 +1,15 @@
-import streamlit as st
+import gradio as gr
 import os
+import shutil
 import datetime
 import sqlite3
 import PyPDF2
 import docx
+import spaces  # 👈 新增引入 spaces，應付 ZeroGPU 檢查
 from smolagents import CodeAgent, InferenceClientModel, tool
 
 # =====================================================================
-# 💾 SQLite 資料庫初始化 (提供 Agent 待辦事項儲存空間)
+# 💾 SQLite 資料庫初始化 
 # =====================================================================
 def init_db():
     conn = sqlite3.connect('secretary.db')
@@ -20,9 +22,18 @@ def init_db():
     conn.commit()
     conn.close()
 
-# 確保伺服器啟動時，資料庫與資料表已建立
 init_db()
 
+# 為了讓 UI 與 Agent 都能共用，獨立抽出一個讀取任務的函數
+def get_all_tasks_str():
+    conn = sqlite3.connect('secretary.db')
+    c = conn.cursor()
+    c.execute("SELECT id, task_name, status FROM tasks")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "報告：目前清單是空的，您沒有任何待辦事項。"
+    return "\n".join([f"{row[0]}. [{row[2]}] {row[1]}" for row in rows])
 
 # =====================================================================
 # 🛠️ 秘書的五大核心工具定義
@@ -52,14 +63,7 @@ def add_tasks(tasks: list[str]) -> str:
 @tool
 def view_tasks() -> str:
     """查看目前資料庫中所有的待辦事項"""
-    conn = sqlite3.connect('secretary.db')
-    c = conn.cursor()
-    c.execute("SELECT id, task_name, status FROM tasks")
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return "報告：目前清單是空的，您沒有任何待辦事項。"
-    return "\n".join([f"{row[0]}. [{row[2]}] {row[1]}" for row in rows])
+    return get_all_tasks_str()
 
 @tool
 def send_email(subject: str, content: str, recipient_email: str) -> str:
@@ -70,14 +74,6 @@ def send_email(subject: str, content: str, recipient_email: str) -> str:
         content: 郵件內文
         recipient_email: 收件者的 Email 信箱地址
     """
-    # 【模擬發送機制 (Mocking)】
-    print("\n" + "="*50)
-    print("📧 [系統模擬寄信] 攔截到一封即將發送的 Email")
-    print(f"收件者: {recipient_email}")
-    print(f"主旨  : {subject}")
-    print(f"內容  :\n{content}")
-    print("="*50 + "\n")
-    
     return f"報告：已成功(透過模擬系統)發送郵件給 {recipient_email}。信件主旨為「{subject}」。"
 
 @tool
@@ -106,7 +102,6 @@ def read_document(file_path: str) -> str:
         else:
             return f"錯誤：不支援的檔案格式 .{ext}，目前只支援 PDF 與 DOCX。"
             
-        # 防止檔案過大撐爆 LLM 的處理上限
         if len(text_content) > 5000:
             text_content = text_content[:5000] + "...(內容過長已截斷)"
             
@@ -114,135 +109,101 @@ def read_document(file_path: str) -> str:
     except Exception as e:
         return f"讀取檔案失敗：{str(e)}"
 
-
-# =====================================================================
-# 🎨 Streamlit 網頁基本設定與視覺風格 (酒紅與白)
-# =====================================================================
-st.set_page_config(
-    page_title="AI 專業秘書", 
-    page_icon="💼", 
-    layout="centered",
-    initial_sidebar_state="expanded" 
-)
-
-st.markdown("""
-<style>
-    .stApp {
-        background-color: #FFFFFF;
-    }
-    #MainMenu {visibility: hidden;} 
-    .stDeployButton {display: none;} 
-    
-    .block-container {
-        padding-top: 3rem;
-        max-width: 800px; 
-    }
-    
-    .hero-title {
-        text-align: center;
-        font-size: 3.5rem;
-        font-weight: 800;
-        color: #5C0612;
-        margin-bottom: 0.5rem;
-        line-height: 1.2;
-    }
-    .hero-subtitle {
-        text-align: center;
-        font-size: 1.2rem;
-        color: #4B5563;
-        margin-bottom: 2.5rem;
-        font-weight: 500;
-    }
-    .hero-highlight {
-        color: #5C0612;
-        border-bottom: 2px solid #5C0612;
-    }
-    
-    [data-testid="stSidebar"] {
-        background-color: #5C0612;
-    }
-    
-    [data-testid="stSidebar"] __element__ , 
-    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, 
-    [data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label, [data-testid="stSidebar"] li {
-        color: #FFFFFF !important;
-    }
-
-    p, span, label, li {
-        color: #1F2937 !important;
-    }
-    
-    .stTextInput div[data-baseweb="input"]:focus-within {
-        border-color: #5C0612 !important;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-
 # =====================================================================
 # 🧠 初始化 AI 大腦與裝備工具
 # =====================================================================
-@st.cache_resource
-def load_agent():
-    model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-32B-Instruct")
-    # 這裡的 smolagents 會自動從系統環境變數中取得 Secrets 設定的 HF_TOKEN
-    return CodeAgent(
-        tools=[get_current_date, add_tasks, view_tasks, send_email, read_document], 
-        model=model
+# 改用 7B 模型避免觸發免費額度的 Rate Limit
+model = InferenceClientModel(model_id="Qwen/Qwen2.5-Coder-7B-Instruct")
+agent = CodeAgent(
+    tools=[get_current_date, add_tasks, view_tasks, send_email, read_document], 
+    model=model
+)
+
+# =====================================================================
+# 🎨 Gradio 網頁介面設計與邏輯
+# =====================================================================
+
+# 處理對話邏輯
+@spaces.GPU  # 👈 新增這行，讓 Hugging Face 放行
+def chat_with_secretary(user_input, history):
+    # 秘書的隱藏提示詞
+    secretary_instruction = f"""你是一位嚴謹、專業且能力強的執行秘書。
+請根據老闆的要求，自行判斷需要呼叫哪些工具來完成任務。
+老闆的要求是：{user_input}
+完成後，請向老闆簡要回報您執行了哪些動作。"""
+
+    try:
+        # 呼叫 Agent 執行任務
+        response = agent.run(secretary_instruction)
+    except Exception as e:
+        response = f"⚠️ 秘書系統發生錯誤：{str(e)}"
+    
+    # 回傳：(空字串清空輸入框), (更新後的對話紀錄), (更新後的待辦清單)
+    history.append((user_input, response))
+    return "", history, get_all_tasks_str()
+
+# 處理檔案上傳邏輯
+def handle_upload(filepath):
+    if not filepath:
+        return "未選擇檔案"
+    # 從暫存路徑中提取原始檔名，並複製到當前目錄供 Agent 讀取
+    filename = os.path.basename(filepath)
+    target_path = os.path.join(os.getcwd(), filename)
+    shutil.copy(filepath, target_path)
+    return f"✅ 檔案已就緒：{filename} (AI 秘書已經可以讀取了)"
+
+# 建立 Gradio UI 佈局 (清空 Blocks 參數)
+with gr.Blocks() as demo:
+    gr.Markdown("<h1 style='text-align: center; color: #5C0612;'>💼 專屬您的 AI 執行秘書</h1>")
+    gr.Markdown("<p style='text-align: center; color: #4B5563;'>只需一句指令，自動為您拆解專案、發送郵件與閱讀文件。</p>")
+    
+    with gr.Row():
+        # 左側邊欄：待辦清單與檔案上傳
+        with gr.Column(scale=1):
+            gr.Markdown("### 📝 專案待辦清單")
+            task_display = gr.Textbox(
+                label="目前待辦", 
+                value=get_all_tasks_str(), 
+                interactive=False, 
+                lines=10
+            )
+            refresh_btn = gr.Button("🔄 手動更新清單", size="sm")
+            
+            gr.Markdown("---")
+            gr.Markdown("### 📎 參考文件上傳")
+            file_upload = gr.File(label="上傳 PDF 或 DOCX", file_types=[".pdf", ".docx"], type="filepath")
+            upload_status = gr.Textbox(label="上傳狀態", interactive=False)
+            
+        # 右側邊欄：聊天介面
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot(label="秘書對話記錄", height=550)
+            user_input = gr.Textbox(
+                label="發送指令", 
+                placeholder="老闆，有什麼計畫需要幫您處理？ (輸入完請按 Enter)", 
+                lines=2
+            )
+            clear_btn = gr.ClearButton([user_input, chatbot], value="🗑️ 清除對話紀錄")
+
+    # 綁定事件邏輯
+    # 1. 使用者送出訊息：觸發對話並同時更新待辦清單
+    user_input.submit(
+        chat_with_secretary, 
+        inputs=[user_input, chatbot], 
+        outputs=[user_input, chatbot, task_display]
+    )
+    # 2. 檔案上傳完成：將檔案複製到正確位置並更新狀態提示
+    file_upload.upload(
+        handle_upload, 
+        inputs=[file_upload], 
+        outputs=[upload_status]
+    )
+    # 3. 手動更新待辦按鈕
+    refresh_btn.click(
+        get_all_tasks_str, 
+        inputs=None, 
+        outputs=[task_display]
     )
 
-agent = load_agent()
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-
-# =====================================================================
-# 📝 可收縮的側邊欄 (待辦清單與文件上傳)
-# =====================================================================
-with st.sidebar:
-    st.header("📝 專案待辦清單")
-    current_tasks = view_tasks()
-    st.markdown(current_tasks)
-    
-    st.divider()
-    
-    st.header("📎 參考文件上傳")
-    st.caption("支援 PDF 或 DOCX 格式。")
-    uploaded_file = st.file_uploader("點擊或拖曳文件至此", type=["pdf", "docx"])
-    
-    if uploaded_file is not None:
-        file_path = uploaded_file.name
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success(f"✅ 上傳成功：{file_path}")
-
-
-# =====================================================================
-# 💬 主畫面置中對話區
-# =====================================================================
-st.markdown('<div class="hero-title">專屬您的 AI 執行秘書</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-subtitle">只需<span class="hero-highlight">一句指令</span>，自動為您拆解專案、發送郵件與閱讀文件。</div>', unsafe_allow_html=True)
-
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        
-if prompt := st.chat_input("老闆，有什麼計畫需要幫您處理？"):
-    st.chat_message("user").markdown(prompt)
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
-    
-    with st.chat_message("assistant"):
-        with st.spinner("秘書正在思考與處理中..."):
-            secretary_instruction = f"""你是一位嚴謹、專業且能力強的執行秘書。
-請根據老闆的要求，自行判斷需要呼叫哪些工具來完成任務（例如需要查日期就呼叫 get_current_date、需要讀檔就呼叫 read_document、需要記待辦就呼叫 add_tasks、需要寄信就呼叫 send_email）。
-
-老闆的要求是：{prompt}
-
-完成後，請向老闆簡要回報您執行了哪些動作。"""
-            
-            response = agent.run(secretary_instruction)
-            st.markdown(response)
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
-            
-    st.rerun()
+# 啟動伺服器 (將 theme 設定移至此處，解決 Gradio 6.0 的警告)
+if __name__ == "__main__":
+    demo.launch(theme=gr.themes.Soft(primary_hue="red"))
